@@ -1,0 +1,7 @@
+sftp.env
+runtime/
+runtime_pto/
+__pycache__/
+*.py[cod]
+*.log
+*.part

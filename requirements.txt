@@ -1,0 +1,10 @@
+paramiko>=3.4
+pyarrow>=14
+pyodbc>=4.0
+requests>=2.31
+azure-identity>=1.15
+deltalake>=0.25,<1.0
+pandas>=2.0
+pymongo>=4.5
+gradio>=4.0
+huggingface_hub>=0.25
