@@ -247,7 +247,38 @@ def existing_schema(uri: str) -> pa.Schema | None:
     try:
         from deltalake import DeltaTable
         token = storage_token()
-        return DeltaTable(uri, storage_options={"azure_storage_account_name": "onelake", "azure_storage_token": token, "use_fabric_endpoint": "true"}).schema().to_pyarrow()
+        delta_schema = DeltaTable(uri, storage_options={"azure_storage_account_name": "onelake", "azure_storage_token": token, "use_fabric_endpoint": "true"}).schema()
+        # Delta Lake clients before 1.6 expose to_pyarrow(); newer clients
+        # expose to_arrow(). Support both so existing column-mapped tables are
+        # aligned instead of incorrectly entering schema-evolution mode.
+        converter = getattr(delta_schema, "to_pyarrow", None)
+        if converter is not None:
+            return converter()
+        # Delta Lake 1.x returns an arro3 Schema. Convert the small set of
+        # primitive types used by these raw feeds without requiring an arro3 /
+        # PyArrow bridge in the runtime.
+        definition = delta_schema.json()
+        primitive = {
+            "string": pa.string(), "binary": pa.binary(), "byte": pa.int8(),
+            "short": pa.int16(), "integer": pa.int32(), "long": pa.int64(),
+            "float": pa.float32(), "double": pa.float64(), "boolean": pa.bool_(),
+            "date": pa.date32(), "timestamp": pa.timestamp("us", tz="UTC"),
+            "timestamp_ntz": pa.timestamp("us"),
+        }
+        fields = []
+        for field in definition.get("fields", []):
+            field_type = field.get("type")
+            if isinstance(field_type, str):
+                arrow_type = primitive.get(field_type)
+                if arrow_type is None and field_type.startswith("decimal("):
+                    precision, scale = (int(x) for x in field_type[8:-1].split(","))
+                    arrow_type = pa.decimal128(precision, scale)
+                if arrow_type is None:
+                    raise RuntimeError(f"Unsupported Delta field type: {field_type}")
+            else:
+                raise RuntimeError("Unsupported nested Delta field type")
+            fields.append(pa.field(field["name"], arrow_type, nullable=bool(field.get("nullable", True))))
+        return pa.schema(fields)
     except Exception:
         return None
 
@@ -318,7 +349,20 @@ def process_item(item: dict[str, Any], state: dict[str, Any], user: str | None, 
     local_path = Path(item.get("local_path") or copy_remote(item, user or "", password or ""))
     arrow_table = read_csv(local_path, key, str(item["feed"]))
     table_name = str(FEEDS[str(item["feed"])]["table"])
-    write_delta(arrow_table, table_name)
+    try:
+        write_delta(arrow_table, table_name)
+    except Exception as exc:
+        # The pre-existing cohorts table is a schema-enabled Fabric shortcut
+        # and rejects direct OneLake PUTs. Preserve the new source safely as a
+        # Parquet snapshot and mark the SQL append as pending instead of
+        # retrying the same impossible operation every cycle.
+        if str(item["feed"]) == "cohorts" and "ShortcutPath" in str(exc):
+            files_path = upload_files_copy(arrow_table, str(item["feed"]), key)
+            state["files"][key] = {"signature": signature, "feed": item["feed"], "table": table_name, "rows": arrow_table.num_rows, "managed_table": f"{SCHEMA}.{table_name}", "parquet_directory": f"Files/{FILES_ROOT}/{table_name}", "parquet_path": files_path, "status": "parquet_snapshot_pending_lakehouse_append", "reason": "Existing schema-enabled cohorts table is exposed through a read-only shortcut path; direct Delta append was rejected by OneLake.", "completed_at_utc": now_utc().isoformat()}
+            save_state(state)
+            logging.warning("Saved %s rows from %s as Parquet snapshot; canonical cohorts SQL append requires the Fabric table-load path", arrow_table.num_rows, item["name"])
+            return
+        raise
     files_path = upload_files_copy(arrow_table, str(item["feed"]), key)
     state["files"][key] = {"signature": signature, "feed": item["feed"], "table": table_name, "rows": arrow_table.num_rows, "managed_table": f"{SCHEMA}.{table_name}", "parquet_directory": f"Files/{FILES_ROOT}/{table_name}", "parquet_path": files_path, "completed_at_utc": now_utc().isoformat()}
     save_state(state)

@@ -84,7 +84,7 @@ The PTO loader defaults to FABRIC8's dedicated UAT workspace, Lakehouse, Warehou
 
 ## Canonical consolidated worker
 
-The consolidated worker checks all four feeds every 24 hours, downloads only unseen source signatures, appends normalized records to the matching `paycom` managed table, and writes a Parquet review copy under the matching `Files/paycom_parquet/<table>/` directory. It uses the workspace and Lakehouse IDs, avoiding ambiguity when friendly names are duplicated in the tenant.
+The consolidated worker checks all four feeds every 24 hours, downloads only unseen source signatures, appends normalized records to the matching `paycom` managed table, and writes a Parquet review copy under the matching `Files/paycom_parquet/<table>/` directory. It uses the workspace and Lakehouse IDs, avoiding ambiguity when friendly names are duplicated in the tenant. The pre-existing `paycom_cohorts` table is a schema-enabled shortcut that rejects direct OneLake appends; for that table the worker persists the new source as a clearly marked Parquet snapshot and records the SQL append as pending for the Fabric table-load path rather than retrying an impossible write.
 
 One cycle:
 
