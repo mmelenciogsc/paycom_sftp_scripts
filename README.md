@@ -9,7 +9,7 @@ All four recognized feeds use the same UAT Lakehouse and schema:
 - Workspace: `ws_uat`
 - Lakehouse: `lh_uat_theoria_bronze`
 - Schema: `paycom`
-- Managed Delta/SQL tables: `paycom.paycom_employee_schedules`, `paycom.paycom_theoria_shifts`, `paycom.paycom_cohorts`, and `paycom.paycom_pto_raw`
+- Managed Delta/SQL tables: `paycom.paycom_employee_schedules`, `paycom.paycom_theoria_shifts`, `paycom.paycom_cohorts`, and `paycom.paycom_pto_raw` (the cohorts object is the read projection of the Warehouse-backed canonical cohorts loader)
 - Reviewable Parquet copies: `Files/paycom_parquet/paycom_employee_schedules/`, `Files/paycom_parquet/paycom_theoria_shifts/`, `Files/paycom_parquet/paycom_cohorts/`, and `Files/paycom_parquet/paycom_pto_raw/`
 
 The managed Delta tables are the Lakehouse SQL-endpoint counterparts. Fabric may take time to expose a newly created Delta table through `INFORMATION_SCHEMA`; the OneLake Delta log and the SQL endpoint are both checked during validation.
@@ -20,7 +20,7 @@ The managed Delta tables are the Lakehouse SQL-endpoint counterparts. Fabric may
 - `paycom_pto_sftp_to_fabric.py` loads new PTO/time-off CSV exports into the dedicated UAT Lakehouse and Warehouse destination (`paycom_pto_raw`).
 - `paycom_cohorts_to_fabric.py` watches `Cohorts-PaycomID` exports and appends them to `tm_charteasy.dbo.paycom_cohorts_bronze`.
 
-The older scripts remain available for compatibility and historical recovery. They are not the canonical recurring path after `paycom_consolidated_to_lakehouse.py` is enabled.
+The older scripts remain available for compatibility and historical recovery. The dedicated cohorts watcher remains the canonical recurring SQL append path because the existing `paycom.paycom_cohorts` object is a read-only shortcut; the consolidated worker owns download/signature state and the reviewable Parquet copy without issuing unsupported writes to that shortcut.
 
 The bundle includes the local `FDI_z/utils.py` helper required by the daily loader, the verified Paycom host-key file, and the report logo used by the existing loader. No credentials are included.
 
@@ -61,7 +61,7 @@ python paycom_sftp2fabric.py --run-once --check-mode auto --server "$PAYCOM_FABR
 Run continuously with an hourly interval:
 
 ```bash
-python paycom_sftp2fabric.py --interval 86400 --check-mode auto --server "$PAYCOM_FABRIC_SERVER"
+python paycom_sftp2fabric.py --interval 3600 --check-mode auto --server "$PAYCOM_FABRIC_SERVER"
 ```
 
 The default working directory is `./runtime`; override it with `PAYCOM_SFTP_WORK_ROOT`. The existing target database/table names and the default Fabric server are retained for the FABRIC8 environment; use `PAYCOM_FABRIC_SERVER` or `--server` for another tenant.
@@ -74,7 +74,7 @@ Run one cycle:
 python paycom_pto_sftp_to_fabric.py --once
 ```
 
-Run continuously with a 24-hour interval:
+Run continuously with an hourly interval:
 
 ```bash
 python paycom_pto_sftp_to_fabric.py --interval-hours 1
@@ -84,7 +84,7 @@ The PTO loader defaults to FABRIC8's dedicated UAT workspace, Lakehouse, Warehou
 
 ## Canonical consolidated worker
 
-The consolidated worker checks all four feeds every hour, downloads only unseen source signatures, appends normalized records to the matching `paycom` managed table, and writes a Parquet review copy under the matching `Files/paycom_parquet/<table>/` directory. It uses the workspace and Lakehouse IDs, avoiding ambiguity when friendly names are duplicated in the tenant. The pre-existing `paycom_cohorts` table is a schema-enabled shortcut that rejects direct OneLake appends; for that table the worker persists the new source as a clearly marked Parquet snapshot and records the SQL append as pending for the Fabric table-load path rather than retrying an impossible write.
+The consolidated worker checks all four feeds every hour, downloads only unseen source signatures, appends normalized records to the matching writable `paycom` managed table, and writes a Parquet review copy under the matching `Files/paycom_parquet/<table>/` directory. It uses workspace and Lakehouse IDs, avoiding friendly-name ambiguity. `paycom.paycom_cohorts` is a Warehouse-backed read-only shortcut: the dedicated cohorts watcher appends to `tm_charteasy.dbo.paycom_cohorts_bronze`, and the consolidated worker records a source as loaded only after the dedicated watcher's durable receipt confirms the same source signature. If a writable schemas-enabled cohorts table is provisioned later, set `PAYCOM_COHORTS_EXTERNAL_LOADER=0` to use the supported Fabric Load Schema Table API instead.
 
 One cycle:
 

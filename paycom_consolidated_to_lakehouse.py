@@ -44,6 +44,15 @@ DOWNLOAD_ROOT = RUNTIME_ROOT / "downloads"
 PARQUET_ROOT = RUNTIME_ROOT / "parquet"
 FILES_ROOT = "paycom_parquet"
 INTERVAL_SECONDS = 60 * 60
+LOAD_TIMEOUT_SECONDS = int(os.environ.get("PAYCOM_FABRIC_LOAD_TIMEOUT_SECONDS", "900"))
+# In the deployed UAT tenant, paycom.paycom_cohorts is a read-only shortcut
+# backed by the existing tm_charteasy Warehouse table. The dedicated cohorts
+# watcher owns its append path. Set this to 0 only when a writable schemas-
+# enabled table has been provisioned and the Fabric Load Schema Table API is
+# authorized for this identity.
+COHORTS_EXTERNAL_LOADER = os.environ.get("PAYCOM_COHORTS_EXTERNAL_LOADER", "1").strip().lower() not in {"0", "false", "no"}
+_default_external_state = PACKAGE_ROOT.parent / "orig_ai_mips" / "ai-mips" / "state" / "create_paycom_cohorts_bronze_fabric_table_state.json"
+COHORTS_EXTERNAL_STATE = Path(os.environ.get("PAYCOM_COHORTS_EXTERNAL_STATE_FILE", str(_default_external_state))).expanduser()
 
 FEEDS: dict[str, dict[str, Any]] = {
     "employee_schedules": {"pattern": "*Employee Schedules*.csv", "table": "paycom_employee_schedules"},
@@ -101,6 +110,25 @@ def save_state(state: dict[str, Any]) -> None:
     temporary = STATE_PATH.with_suffix(".tmp")
     temporary.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
     temporary.replace(STATE_PATH)
+
+
+def external_cohorts_processed(remote_path: str, signature: str) -> bool:
+    """Check the dedicated cohorts watcher's durable receipt, if available."""
+    if not COHORTS_EXTERNAL_STATE.is_file():
+        return False
+    try:
+        payload = json.loads(COHORTS_EXTERNAL_STATE.read_text(encoding="utf-8"))
+        receipt = str((payload.get("processed_files") or {}).get(remote_path, ""))
+        if receipt == signature:
+            return True
+        # The legacy watcher stores SFTP mtime in nanoseconds while the
+        # consolidated worker stores seconds. Compare normalized integer mtime.
+        wanted_mtime, _, wanted_size = signature.partition(":")
+        receipt_mtime, _, receipt_size = receipt.partition(":")
+        return bool(wanted_size and wanted_size == receipt_size and receipt_mtime.isdigit() and wanted_mtime.isdigit() and int(receipt_mtime) // 1_000_000_000 == int(wanted_mtime))
+    except Exception:
+        logging.warning("Could not inspect the dedicated cohorts state file; leaving source pending")
+        return False
 
 
 def list_remote(user: str, password: str) -> list[dict[str, Any]]:
@@ -237,6 +265,18 @@ def storage_token() -> str:
     raise RuntimeError("Azure storage authentication is unavailable")
 
 
+def fabric_api_token() -> str:
+    """Return a token for the Fabric REST API using the VM's existing identity."""
+    if AzureCliCredential is None:
+        raise RuntimeError("azure-identity is required for Fabric table loads")
+    for credential_type in (AzureCliCredential, ManagedIdentityCredential, EnvironmentCredential, DefaultAzureCredential):
+        try:
+            return credential_type().get_token("https://api.fabric.microsoft.com/.default").token
+        except Exception:
+            continue
+    raise RuntimeError("Fabric REST authentication is unavailable")
+
+
 def table_uri(table: str) -> str:
     # IDs are required here because the current tenant contains another workspace
     # with the same friendly name. This avoids ambiguous OneLake resolution.
@@ -257,12 +297,12 @@ def existing_schema(uri: str) -> pa.Schema | None:
         # Delta Lake 1.x returns an arro3 Schema. Convert the small set of
         # primitive types used by these raw feeds without requiring an arro3 /
         # PyArrow bridge in the runtime.
-        definition = delta_schema.json()
+        definition = json.loads(delta_schema.to_json()) if hasattr(delta_schema, "to_json") else delta_schema.json()
         primitive = {
             "string": pa.string(), "binary": pa.binary(), "byte": pa.int8(),
             "short": pa.int16(), "integer": pa.int32(), "long": pa.int64(),
             "float": pa.float32(), "double": pa.float64(), "boolean": pa.bool_(),
-            "date": pa.date32(), "timestamp": pa.timestamp("us", tz="UTC"),
+            "date": pa.date32(), "timestamp": pa.timestamp("us"),
             "timestamp_ntz": pa.timestamp("us"),
         }
         fields = []
@@ -312,8 +352,14 @@ def upload_files_copy(table: pa.Table, feed: str, source_name: str) -> str:
     path = PARQUET_ROOT / feed / (hashlib.sha256(source_name.encode()).hexdigest() + ".parquet")
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, path, compression="snappy")
-    token = storage_token()
     relative = f"{FILES_ROOT}/{FEEDS[feed]['table']}/{path.name}"
+    upload_local_file(path, relative)
+    return relative
+
+
+def upload_local_file(path: Path, relative: str) -> str:
+    """Upload a local file to Files using the OneLake filesystem API."""
+    token = storage_token()
     base = f"https://onelake.dfs.fabric.microsoft.com/{WORKSPACE_ID}/{LAKEHOUSE_ID}/Files"
     url = f"{base}/{relative}"
     headers = {"Authorization": f"Bearer {token}", "x-ms-version": "2021-12-02", "Content-Type": "application/octet-stream"}
@@ -340,29 +386,106 @@ def upload_files_copy(table: pa.Table, feed: str, source_name: str) -> str:
     return relative
 
 
+def load_schema_table(table_name: str, source_path: Path, *, mode: str = "Append", format_name: str = "Csv") -> str:
+    """Load a CSV into a schema-enabled Lakehouse table through Fabric's API.
+
+    Schema-enabled tables and shortcuts reject direct Delta PUT/append calls.
+    The supported table-load operation accepts a Files-relative CSV and returns
+    an operation URL that must be polled before recording success.
+    """
+    relative = f"paycom_ingest/{table_name}/{source_path.name}"
+    upload_local_file(source_path, relative)
+    endpoint = (
+        f"https://api.fabric.microsoft.com/v1/workspaces/{WORKSPACE_ID}"
+        f"/lakehouses/{LAKEHOUSE_ID}/schemas/{SCHEMA}/tables/{table_name}/load?beta=true"
+    )
+    format_options: dict[str, Any] = {"format": format_name}
+    if format_name.lower() == "csv":
+        format_options.update({"header": True, "delimiter": ","})
+    body = {
+        "relativePath": f"Files/{relative}",
+        "pathType": "File",
+        "mode": mode,
+        "formatOptions": format_options,
+    }
+    response = requests.post(
+        endpoint,
+        headers={"Authorization": f"Bearer {fabric_api_token()}", "Content-Type": "application/json"},
+        json=body,
+        timeout=60,
+    )
+    if response.status_code not in {200, 201, 202}:
+        raise RuntimeError(f"Fabric table load submission failed ({response.status_code}): {response.text[:500]}")
+    operation_url = response.headers.get("Location")
+    if not operation_url:
+        # Some successful responses are synchronous and contain no operation.
+        return "synchronous"
+    operation_id = operation_url.rstrip("/").rsplit("/", 1)[-1]
+    deadline = time.monotonic() + LOAD_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        status_response = requests.get(
+            operation_url,
+            headers={"Authorization": f"Bearer {fabric_api_token()}"},
+            timeout=60,
+        )
+        if status_response.status_code >= 400:
+            raise RuntimeError(f"Fabric table load status failed ({status_response.status_code}): {status_response.text[:500]}")
+        payload = status_response.json() if status_response.content else {}
+        status = str(payload.get("status", payload.get("Status", ""))).strip().lower()
+        if status in {"completed", "success", "succeeded", "done", "3"}:
+            return operation_id
+        if status in {"failed", "error", "canceled", "cancelled", "4", "5"}:
+            detail = payload.get("error") or payload.get("message") or status_response.text[:500]
+            raise RuntimeError(f"Fabric table load operation failed ({operation_id}): {detail}")
+        time.sleep(5)
+    raise TimeoutError(f"Fabric table load operation timed out ({operation_id})")
+
+
+def normalized_parquet(table: pa.Table, table_name: str, source_name: str) -> tuple[Path, pa.Table]:
+    """Write a schema-aligned, typed Parquet file for the table-load API."""
+    aligned = align_table(table, existing_schema(table_uri(table_name)))
+    destination = RUNTIME_ROOT / "lakehouse_load" / table_name / (
+        hashlib.sha256(source_name.encode("utf-8")).hexdigest() + ".parquet"
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(aligned, destination, compression="snappy")
+    return destination, aligned
+
+
 def process_item(item: dict[str, Any], state: dict[str, Any], user: str | None, password: str | None) -> None:
     key = str(item["remote_path"])
     signature = f"{item['mtime']}:{item['size']}"
     prior = state["files"].get(key) or {}
     if prior.get("signature") == signature:
+        if prior.get("status") == "parquet_snapshot_waiting_external_loader" and external_cohorts_processed(key, signature):
+            prior.update({"status": "loaded", "load_method": "Dedicated cohorts watcher -> tm_charteasy.dbo.paycom_cohorts_bronze (Warehouse-backed shortcut)", "completed_at_utc": now_utc().isoformat()})
+            save_state(state)
+            logging.info("Dedicated cohorts watcher receipt confirmed for %s", item["name"])
         return
     local_path = Path(item.get("local_path") or copy_remote(item, user or "", password or ""))
     arrow_table = read_csv(local_path, key, str(item["feed"]))
     table_name = str(FEEDS[str(item["feed"])]["table"])
-    try:
-        write_delta(arrow_table, table_name)
-    except Exception as exc:
-        # The pre-existing cohorts table is a schema-enabled Fabric shortcut
-        # and rejects direct OneLake PUTs. Preserve the new source safely as a
-        # Parquet snapshot and mark the SQL append as pending instead of
-        # retrying the same impossible operation every cycle.
-        if str(item["feed"]) == "cohorts" and "ShortcutPath" in str(exc):
-            files_path = upload_files_copy(arrow_table, str(item["feed"]), key)
-            state["files"][key] = {"signature": signature, "feed": item["feed"], "table": table_name, "rows": arrow_table.num_rows, "managed_table": f"{SCHEMA}.{table_name}", "parquet_directory": f"Files/{FILES_ROOT}/{table_name}", "parquet_path": files_path, "status": "parquet_snapshot_pending_lakehouse_append", "reason": "Existing schema-enabled cohorts table is exposed through a read-only shortcut path; direct Delta append was rejected by OneLake.", "completed_at_utc": now_utc().isoformat()}
+    # The deployed cohorts object is a Warehouse-backed shortcut. Its existing
+    # dedicated watcher appends the source to tm_charteasy.dbo.paycom_cohorts_bronze,
+    # which is reflected in paycom.paycom_cohorts. Keep a complete Parquet copy
+    # here and do not issue futile direct-Delta/API writes to that shortcut.
+    if str(item["feed"]) == "cohorts":
+        if COHORTS_EXTERNAL_LOADER:
+            _, aligned = normalized_parquet(arrow_table, table_name, key)
+            files_path = upload_files_copy(aligned, str(item["feed"]), key)
+            loaded = external_cohorts_processed(key, signature)
+            state["files"][key] = {"signature": signature, "feed": item["feed"], "table": table_name, "rows": arrow_table.num_rows, "managed_table": f"{SCHEMA}.{table_name}", "parquet_directory": f"Files/{FILES_ROOT}/{table_name}", "parquet_path": files_path, "status": "loaded" if loaded else "parquet_snapshot_waiting_external_loader", "load_method": "Dedicated cohorts watcher -> tm_charteasy.dbo.paycom_cohorts_bronze (Warehouse-backed shortcut)" if loaded else "Dedicated cohorts watcher pending", "external_state_file": str(COHORTS_EXTERNAL_STATE), "completed_at_utc": now_utc().isoformat() if loaded else None}
             save_state(state)
-            logging.warning("Saved %s rows from %s as Parquet snapshot; canonical cohorts SQL append requires the Fabric table-load path", arrow_table.num_rows, item["name"])
+            logging.info("Retained %s rows from %s as Parquet; dedicated cohorts SQL receipt=%s", arrow_table.num_rows, item["name"], loaded)
             return
-        raise
+        load_parquet, aligned = normalized_parquet(arrow_table, table_name, key)
+        operation_id = load_schema_table(table_name, load_parquet, format_name="Parquet")
+        files_path = upload_files_copy(aligned, str(item["feed"]), key)
+        state["files"][key] = {"signature": signature, "feed": item["feed"], "table": table_name, "rows": arrow_table.num_rows, "managed_table": f"{SCHEMA}.{table_name}", "parquet_directory": f"Files/{FILES_ROOT}/{table_name}", "parquet_path": files_path, "status": "loaded", "load_method": "Fabric Load Table API", "load_operation_id": operation_id, "completed_at_utc": now_utc().isoformat()}
+        save_state(state)
+        logging.info("Loaded %s rows from %s to %s.%s via Fabric Load Table API (%s)", arrow_table.num_rows, item["name"], SCHEMA, table_name, operation_id)
+        return
+    write_delta(arrow_table, table_name)
     files_path = upload_files_copy(arrow_table, str(item["feed"]), key)
     state["files"][key] = {"signature": signature, "feed": item["feed"], "table": table_name, "rows": arrow_table.num_rows, "managed_table": f"{SCHEMA}.{table_name}", "parquet_directory": f"Files/{FILES_ROOT}/{table_name}", "parquet_path": files_path, "completed_at_utc": now_utc().isoformat()}
     save_state(state)
