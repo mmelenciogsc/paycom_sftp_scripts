@@ -888,7 +888,7 @@ def main() -> int:
         remote_dir=remote_dir,
         glob_pattern=args.glob_pattern,
         state_path=state_path,
-        interval_hours=float(args.interval_hours or 24.0),
+        interval_hours=float(args.interval_hours or 1.0),
         limit=int(args.limit or 0),
         driver=driver,
         progress_every=int(args.progress_every or 0),

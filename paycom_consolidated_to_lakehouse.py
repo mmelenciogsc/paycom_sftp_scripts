@@ -43,7 +43,7 @@ STATE_PATH = RUNTIME_ROOT / "state.json"
 DOWNLOAD_ROOT = RUNTIME_ROOT / "downloads"
 PARQUET_ROOT = RUNTIME_ROOT / "parquet"
 FILES_ROOT = "paycom_parquet"
-INTERVAL_SECONDS = 24 * 60 * 60
+INTERVAL_SECONDS = 60 * 60
 
 FEEDS: dict[str, dict[str, Any]] = {
     "employee_schedules": {"pattern": "*Employee Schedules*.csv", "table": "paycom_employee_schedules"},
@@ -415,7 +415,7 @@ def run_once(local_root: Path | None, bootstrap: str) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--once", action="store_true", help="Run one cycle and exit")
-    parser.add_argument("--interval-hours", type=float, default=24.0)
+    parser.add_argument("--interval-hours", type=float, default=1.0)
     parser.add_argument("--local-root", type=Path, default=None, help="Use a local staged SFTP directory instead of remote SFTP")
     parser.add_argument("--bootstrap", choices=("latest", "all"), default="latest", help="Initial state behavior")
     args = parser.parse_args()

@@ -58,7 +58,7 @@ Run one polling cycle:
 python paycom_sftp2fabric.py --run-once --check-mode auto --server "$PAYCOM_FABRIC_SERVER"
 ```
 
-Run continuously with a 24-hour interval:
+Run continuously with an hourly interval:
 
 ```bash
 python paycom_sftp2fabric.py --interval 86400 --check-mode auto --server "$PAYCOM_FABRIC_SERVER"
@@ -77,14 +77,14 @@ python paycom_pto_sftp_to_fabric.py --once
 Run continuously with a 24-hour interval:
 
 ```bash
-python paycom_pto_sftp_to_fabric.py --interval-hours 24
+python paycom_pto_sftp_to_fabric.py --interval-hours 1
 ```
 
 The PTO loader defaults to FABRIC8's dedicated UAT workspace, Lakehouse, Warehouse, database, and `paycom_pto_raw` table. For another environment, override the `PAYCOM_PTO_*` variables shown in `.env.example`. Its default working directory is `./runtime_pto`; override it with `PAYCOM_PTO_RUNTIME_ROOT`.
 
 ## Canonical consolidated worker
 
-The consolidated worker checks all four feeds every 24 hours, downloads only unseen source signatures, appends normalized records to the matching `paycom` managed table, and writes a Parquet review copy under the matching `Files/paycom_parquet/<table>/` directory. It uses the workspace and Lakehouse IDs, avoiding ambiguity when friendly names are duplicated in the tenant. The pre-existing `paycom_cohorts` table is a schema-enabled shortcut that rejects direct OneLake appends; for that table the worker persists the new source as a clearly marked Parquet snapshot and records the SQL append as pending for the Fabric table-load path rather than retrying an impossible write.
+The consolidated worker checks all four feeds every hour, downloads only unseen source signatures, appends normalized records to the matching `paycom` managed table, and writes a Parquet review copy under the matching `Files/paycom_parquet/<table>/` directory. It uses the workspace and Lakehouse IDs, avoiding ambiguity when friendly names are duplicated in the tenant. The pre-existing `paycom_cohorts` table is a schema-enabled shortcut that rejects direct OneLake appends; for that table the worker persists the new source as a clearly marked Parquet snapshot and records the SQL append as pending for the Fabric table-load path rather than retrying an impossible write.
 
 One cycle:
 
@@ -92,10 +92,10 @@ One cycle:
 python paycom_consolidated_to_lakehouse.py --once --bootstrap latest
 ```
 
-Continuous 24-hour worker:
+Continuous hourly worker:
 
 ```bash
-python paycom_consolidated_to_lakehouse.py --interval-hours 24
+python paycom_consolidated_to_lakehouse.py --interval-hours 1
 ```
 
 For the live UAT worker, set `AZURE_CONFIG_DIR` to the approved Azure CLI configuration, provide `SFTP_CREDENTIAL_FILE`, and set `SFTP_KNOWN_HOSTS_PATH`. The worker stores its durable source-signature state and logs under `PAYCOM_CONSOLIDATED_RUNTIME_ROOT`.
@@ -108,10 +108,10 @@ Run one remote check and exit:
 python paycom_cohorts_to_fabric.py --run-once
 ```
 
-Run continuously with a 24-hour interval:
+Run continuously with an hourly interval:
 
 ```bash
-python paycom_cohorts_to_fabric.py --interval-hours 24
+python paycom_cohorts_to_fabric.py --interval-hours 1
 ```
 
 The default matching pattern is `*Cohorts*PaycomID*.csv`. The loader uses source-file path and remote signature state to avoid duplicate appends, validates the inserted row count, and writes to the configured Fabric Warehouse table. Override the Fabric target with `PAYCOM_COHORTS_FABRIC_SERVER`, `PAYCOM_COHORTS_FABRIC_DATABASE`, `PAYCOM_COHORTS_FABRIC_SCHEMA`, and `PAYCOM_COHORTS_FABRIC_TABLE`. Its default state/log/temp root is `./runtime_cohorts`; override it with `PAYCOM_COHORTS_RUNTIME_ROOT`.

@@ -46,7 +46,7 @@ DOWNLOAD_ROOT = RUNTIME_ROOT / "downloads"
 PARQUET_ROOT = RUNTIME_ROOT / "parquet"
 STATE_PATH = RUNTIME_ROOT / "state.json"
 LOG_PATH = RUNTIME_ROOT / "worker.log"
-INTERVAL_SECONDS = 24 * 60 * 60
+INTERVAL_SECONDS = 60 * 60
 
 SOURCE_HEADERS = (
     "Employee Code",
@@ -392,7 +392,7 @@ def run_once() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--once", action="store_true", help="Run one polling cycle and exit")
-    parser.add_argument("--interval-hours", type=float, default=24.0, help="Polling interval in hours")
+    parser.add_argument("--interval-hours", type=float, default=1.0, help="Polling interval in hours")
     args = parser.parse_args()
     configure_logging()
     while True:
