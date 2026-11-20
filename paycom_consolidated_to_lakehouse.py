@@ -387,7 +387,7 @@ def upload_local_file(path: Path, relative: str) -> str:
 
 
 def load_schema_table(table_name: str, source_path: Path, *, mode: str = "Append", format_name: str = "Csv") -> str:
-    """Load a CSV into a schema-enabled Lakehouse table through Fabric's API.
+    """Load a CSV or Parquet file into a schema-enabled Lakehouse table through Fabric's API.
 
     Schema-enabled tables and shortcuts reject direct Delta PUT/append calls.
     The supported table-load operation accepts a Files-relative CSV and returns
